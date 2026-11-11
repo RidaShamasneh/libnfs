@@ -299,6 +299,11 @@ directly from it, which pins that memory while the call is in flight. Processes
 without CAP_IPC_LOCK are limited by RLIMIT_MEMLOCK, which may need raising for
 many large requests in parallel.
 
+The number of requests in flight is 32 by default. It can be changed with
+rdma-slots=<n> or nfs_set_rdma_slots(), from 1 to 256. It is lowered at
+connect time if the RDMA device supports fewer work requests or completions.
+Every slot pins about 72KB of memory for the life of the connection.
+
 Software iWARP (siw) or RoCE (rxe) is enough for testing:
   rdma link add siw0 type siw netdev eth0
 

@@ -24,6 +24,7 @@ set(TEST_PROGS prog_access
                prog_open_write
                prog_opendir
                prog_parse_url_full
+               prog_rdma_slots
                prog_read_update_pos
                prog_rename
                prog_rmdir
@@ -42,6 +43,7 @@ foreach(TARGET ${TEST_PROGS})
 endforeach()
 
 add_test(NAME zdr_alignment COMMAND prog_zdr_alignment)
+add_test(NAME rdma_slots COMMAND prog_rdma_slots)
 
 add_library(ld_timeout SHARED ld_timeout.c)
 set_target_properties(ld_timeout PROPERTIES PREFIX "")

@@ -222,6 +222,23 @@ enum rpc_transport {
 EXTERN int nfs_set_transport(struct nfs_context *nfs, enum rpc_transport transport);
 
 /*
+ * Number of RPC-over-RDMA request slots, i.e. the number of NFS requests that
+ * can be in flight on the connection and the number of credits asked of the
+ * server. The server may grant fewer, and the value is lowered at connect time
+ * if the RDMA device can not support that many. Each slot uses about 72KB of
+ * registered memory. Takes effect on the next connect, and is ignored for
+ * proto=tcp. Mount option: rdma-slots=<n>.
+ *
+ * Returns 0 on success and -1 if slots is outside
+ * RPC_RDMA_MIN_SLOTS..RPC_RDMA_MAX_SLOTS or if this build of libnfs has no
+ * RDMA support, see LIBNFS_FEATURE_RDMA.
+ */
+#define RPC_RDMA_MIN_SLOTS     1
+#define RPC_RDMA_DEFAULT_SLOTS 32
+#define RPC_RDMA_MAX_SLOTS     256
+EXTERN int nfs_set_rdma_slots(struct nfs_context *nfs, int slots);
+
+/*
  * Used if you need to bind to a specific interface.
  * Only available on platforms that support SO_BINDTODEVICE.
  */
@@ -306,6 +323,8 @@ EXTERN int nfs_set_hash_size(struct nfs_context *nfs, int hashes);
  *                     mtls : Mutual TLS, both server and client authentication.
  * proto=<tcp|rdma>  : Transport for NFS. rdma uses RPC-over-RDMA and port
  *                     20049 unless nfsport is given. Default is tcp.
+ * rdma-slots=<int>  : Number of RPC-over-RDMA requests in flight, 1 to 256.
+ *                     Default is 32. Only used with proto=rdma.
  * auto-traverse-mounts=<0|1>
  *                   : Should libnfs try to traverse across nested mounts
  *                     automatically or not. Default is 1 == enabled.
