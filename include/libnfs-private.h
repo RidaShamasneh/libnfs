@@ -645,6 +645,8 @@ struct rpc_context {
 	enum rpc_transport wanted_transport;
 #ifdef HAVE_RDMA
 	int is_rdma;
+	/* Requested number of request slots, 0 for RPC_RDMA_DEFAULT_SLOTS */
+	uint32_t rdma_slots;
 	/* Bumped by every teardown, so callers can tell the connection went away. */
 	uint32_t rdma_gen;
 	struct rpc_rdma *rdma;
