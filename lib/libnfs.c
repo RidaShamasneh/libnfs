@@ -227,6 +227,24 @@ nfs_set_transport(struct nfs_context *nfs, enum rpc_transport transport)
 }
 
 int
+nfs_set_rdma_slots(struct nfs_context *nfs, int slots)
+{
+#ifdef HAVE_RDMA
+	if (slots < RPC_RDMA_MIN_SLOTS || slots > RPC_RDMA_MAX_SLOTS) {
+		nfs_set_error(nfs, "rdma-slots must be between %d and %d",
+			      RPC_RDMA_MIN_SLOTS, RPC_RDMA_MAX_SLOTS);
+		return -1;
+	}
+	nfs->rpc->rdma_slots = slots;
+	return 0;
+#else
+	(void)slots;
+	nfs_set_error(nfs, "libnfs was built without RDMA support");
+	return -1;
+#endif
+}
+
+int
 nfs_nfsport(struct nfs_context *nfs)
 {
 	if (nfs->nfsi->nfsport) {
@@ -440,6 +458,18 @@ nfs_set_context_args(struct nfs_context *nfs, const char *arg, const char *val)
 			return -1;
 		}
 		if (nfs_set_transport(nfs, transport) < 0) {
+			return -1;
+		}
+	} else if (!strcmp(arg, "rdma-slots")) {
+		char *end;
+		long v = strtol(val, &end, 10);
+
+		if (*val == '\0' || *end != '\0') {
+			nfs_set_error(nfs, "Invalid rdma-slots : %s", val);
+			return -1;
+		}
+		if (nfs_set_rdma_slots(nfs, v < INT_MIN || v > INT_MAX ?
+				       -1 : (int)v) < 0) {
 			return -1;
 		}
 	} else if (!strcmp(arg, "nfsport")) {
