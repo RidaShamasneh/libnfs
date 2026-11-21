@@ -46,10 +46,13 @@
 #define ERR_VERS                1
 #define ERR_CHUNK               2
 
-/* Requests in flight, also the credits we ask the server for */
-#define RPCRDMA_SLOTS           32
+/*
+ * Requests in flight, also the credits we ask the server for. The number of
+ * slots is RPC_RDMA_DEFAULT_SLOTS unless changed with nfs_set_rdma_slots(),
+ * and may be lowered at connect time to fit the device limits.
+ */
 /* Spare receives so a reply can be processed before its buffer is reposted */
-#define RPCRDMA_RECVS           (RPCRDMA_SLOTS + 2)
+#define RPCRDMA_SPARE_RECVS     2
 #define RPCRDMA_MIN_INLINE      1024
 #define RPCRDMA_INLINE          4096
 /* Coalesces the small pieces of a long call */
@@ -104,7 +107,10 @@ struct rpc_rdma {
         uint32_t credits;
         uint32_t outstanding;
         uint32_t inline_send;
-        struct rpc_rdma_slot slots[RPCRDMA_SLOTS];
+        /* Number of entries in slots[], and of receives posted */
+        uint32_t nslots;
+        uint32_t nrecvs;
+        struct rpc_rdma_slot *slots;
 };
 
 static void
@@ -224,7 +230,7 @@ rdma_post_recv(struct rpc_rdma *r, uint32_t idx)
         sge.length = RPCRDMA_INLINE;
         sge.lkey = r->pool_mr->lkey;
         memset(&wr, 0, sizeof(wr));
-        wr.wr_id = RPCRDMA_SLOTS + idx;
+        wr.wr_id = r->nslots + idx;
         wr.sg_list = &sge;
         wr.num_sge = 1;
         return ibv_post_recv(r->id->qp, &wr, &bad);
@@ -234,7 +240,7 @@ void
 rpc_rdma_teardown(struct rpc_context *rpc)
 {
         struct rpc_rdma *r;
-        int i;
+        uint32_t i;
 
         rdma_lock(rpc);
         r = rpc->rdma;
@@ -244,7 +250,7 @@ rpc_rdma_teardown(struct rpc_context *rpc)
         }
         rpc->rdma = NULL;
         rpc->rdma_gen++;
-        for (i = 0; i < RPCRDMA_SLOTS; i++) {
+        for (i = 0; i < r->nslots; i++) {
                 slot_release(&r->slots[i]);
         }
         rdma_unlock(rpc);
@@ -255,7 +261,7 @@ rpc_rdma_teardown(struct rpc_context *rpc)
         if (r->has_qp) {
                 rdma_destroy_qp(r->id);
         }
-        for (i = 0; i < RPCRDMA_SLOTS; i++) {
+        for (i = 0; i < r->nslots; i++) {
                 if (r->slots[i].call_mr) {
                         ibv_dereg_mr(r->slots[i].call_mr);
                 }
@@ -267,6 +273,7 @@ rpc_rdma_teardown(struct rpc_context *rpc)
                 ibv_dereg_mr(r->pool_mr);
         }
         free(r->pool);
+        free(r->slots);
         if (r->cq) {
                 ibv_destroy_cq(r->cq);
         }
@@ -310,6 +317,14 @@ rpc_rdma_connect(struct rpc_context *rpc)
 
         r = calloc(1, sizeof(*r));
         if (r == NULL) {
+                rpc_set_error(rpc, "Failed to allocate RDMA transport");
+                return -1;
+        }
+        r->nslots = rpc->rdma_slots ? rpc->rdma_slots : RPC_RDMA_DEFAULT_SLOTS;
+        r->nrecvs = r->nslots + RPCRDMA_SPARE_RECVS;
+        r->slots = calloc(r->nslots, sizeof(*r->slots));
+        if (r->slots == NULL) {
+                free(r);
                 rpc_set_error(rpc, "Failed to allocate RDMA transport");
                 return -1;
         }
@@ -372,7 +387,36 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         uint32_t magic = htonl(RPCRDMA_CMP_MAGIC);
         size_t local_size, remote_size;
         char *remote;
-        int i, e;
+        uint32_t i;
+        int e, have_dattr;
+
+        /*
+         * Every slot needs a send and every receive a work request, and the
+         * completion queue has to hold both. Use fewer slots than asked for
+         * if the device can not do that many.
+         */
+        have_dattr = ibv_query_device(r->id->verbs, &dattr) == 0;
+        if (have_dattr) {
+                uint32_t max = dattr.max_qp_wr;
+
+                if (max > RPCRDMA_SPARE_RECVS &&
+                    (uint32_t)dattr.max_cqe > 2 * RPCRDMA_SPARE_RECVS) {
+                        uint32_t by_cq = (dattr.max_cqe - RPCRDMA_SPARE_RECVS) / 2;
+
+                        max -= RPCRDMA_SPARE_RECVS;
+                        if (by_cq < max) {
+                                max = by_cq;
+                        }
+                } else {
+                        max = r->nslots;
+                }
+                if (r->nslots > max) {
+                        RPC_LOG(rpc, 1, "RDMA device limits slots to %u "
+                                "(%u requested)", max, r->nslots);
+                        r->nslots = max;
+                        r->nrecvs = max + RPCRDMA_SPARE_RECVS;
+                }
+        }
 
         r->pd = ibv_alloc_pd(r->id->verbs);
         if (r->pd == NULL) {
@@ -382,7 +426,7 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         if (r->cc == NULL || rdma_epoll_add(rpc, r->cc->fd) != 0) {
                 return setup_failed(rpc, "Setting up the completion channel");
         }
-        r->cq = ibv_create_cq(r->id->verbs, RPCRDMA_SLOTS + RPCRDMA_RECVS,
+        r->cq = ibv_create_cq(r->id->verbs, r->nslots + r->nrecvs,
                               NULL, r->cc, 0);
         if (r->cq == NULL || ibv_req_notify_cq(r->cq, 0) != 0) {
                 return setup_failed(rpc, "Setting up the completion queue");
@@ -392,8 +436,8 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         attr.send_cq = r->cq;
         attr.recv_cq = r->cq;
         attr.qp_type = IBV_QPT_RC;
-        attr.cap.max_send_wr = RPCRDMA_SLOTS;
-        attr.cap.max_recv_wr = RPCRDMA_RECVS;
+        attr.cap.max_send_wr = r->nslots;
+        attr.cap.max_recv_wr = r->nrecvs;
         attr.cap.max_send_sge = 1;
         attr.cap.max_recv_sge = 1;
         if (rdma_create_qp(r->id, r->pd, &attr) != 0) {
@@ -401,8 +445,8 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         }
         r->has_qp = 1;
 
-        local_size = (RPCRDMA_SLOTS + RPCRDMA_RECVS) * RPCRDMA_INLINE;
-        remote_size = RPCRDMA_SLOTS * (RPCRDMA_CALL_SIZE + RPCRDMA_REPLY_SIZE);
+        local_size = (size_t)(r->nslots + r->nrecvs) * RPCRDMA_INLINE;
+        remote_size = (size_t)r->nslots * (RPCRDMA_CALL_SIZE + RPCRDMA_REPLY_SIZE);
         if (posix_memalign((void **)&r->pool, 4096, local_size + remote_size) != 0) {
                 r->pool = NULL;
                 rpc_set_error(rpc, "Failed to allocate RDMA buffers");
@@ -413,9 +457,9 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         if (r->pool_mr == NULL) {
                 goto reg_failed;
         }
-        r->recv_bufs = r->pool + RPCRDMA_SLOTS * RPCRDMA_INLINE;
+        r->recv_bufs = r->pool + (size_t)r->nslots * RPCRDMA_INLINE;
         remote = r->pool + local_size;
-        for (i = 0; i < RPCRDMA_SLOTS; i++) {
+        for (i = 0; i < r->nslots; i++) {
                 struct rpc_rdma_slot *slot = &r->slots[i];
 
                 slot->send_buf = r->pool + i * RPCRDMA_INLINE;
@@ -432,7 +476,7 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
                         goto reg_failed;
                 }
         }
-        for (i = 0; i < RPCRDMA_RECVS; i++) {
+        for (i = 0; i < r->nrecvs; i++) {
                 if (rdma_post_recv(r, i) != 0) {
                         return setup_failed(rpc, "ibv_post_recv()");
                 }
@@ -448,7 +492,7 @@ rdma_setup(struct rpc_context *rpc, struct rpc_rdma *r)
         param.private_data = pdata;
         param.private_data_len = sizeof(pdata);
         /* The server RDMA Reads our long calls */
-        if (ibv_query_device(r->id->verbs, &dattr) == 0) {
+        if (have_dattr) {
                 param.responder_resources = dattr.max_qp_rd_atom > 255 ?
                         255 : dattr.max_qp_rd_atom;
         }
@@ -713,7 +757,7 @@ rdma_send_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
             r->outstanding >= r->credits) {
                 return 1;
         }
-        for (i = 0; i < RPCRDMA_SLOTS; i++) {
+        for (i = 0; i < (int)r->nslots; i++) {
                 if (!r->slots[i].in_use && !r->slots[i].send_pending) {
                         slot = &r->slots[i];
                         break;
@@ -734,7 +778,7 @@ rdma_send_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
         end = (uint32_t *)(void *)(slot->send_buf + r->inline_send - tail);
         *p++ = htonl(pdu->xid);
         *p++ = htonl(RPCRDMA_VERSION);
-        *p++ = htonl(RPCRDMA_SLOTS);
+        *p++ = htonl(r->nslots);
         *p++ = htonl(inline_call ? RDMA_MSG : RDMA_NOMSG);
 
         if (!inline_call) {
@@ -1040,7 +1084,7 @@ rdma_recv(struct rpc_context *rpc, struct rpc_rdma *r, uint32_t idx,
         if (credit == 0) {
                 credit = 1;
         }
-        r->credits = credit > RPCRDMA_SLOTS ? RPCRDMA_SLOTS : credit;
+        r->credits = credit > r->nslots ? r->nslots : credit;
         if (r->outstanding) {
                 r->outstanding--;
         }
@@ -1148,18 +1192,18 @@ rdma_service_cq(struct rpc_context *rpc, int *err)
                 for (i = 0; i < n; i++) {
                         if (wc[i].status != IBV_WC_SUCCESS) {
                                 rpc_set_error(rpc, "RDMA %s failed: %s",
-                                              wc[i].wr_id < RPCRDMA_SLOTS ?
+                                              wc[i].wr_id < r->nslots ?
                                               "send" : "receive",
                                               ibv_wc_status_str(wc[i].status));
                                 return rdma_dead(rpc, EIO, err);
                         }
-                        if (wc[i].wr_id < RPCRDMA_SLOTS) {
+                        if (wc[i].wr_id < r->nslots) {
                                 rdma_lock(rpc);
                                 r->slots[wc[i].wr_id].send_pending = 0;
                                 rdma_unlock(rpc);
                                 continue;
                         }
-                        if (rdma_recv(rpc, r, wc[i].wr_id - RPCRDMA_SLOTS,
+                        if (rdma_recv(rpc, r, wc[i].wr_id - r->nslots,
                                       wc[i].byte_len) != 0) {
                                 if (rpc->rdma_gen != gen) {
                                         return RPC_RDMA_EV_NONE;
